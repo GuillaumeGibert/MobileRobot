@@ -82,6 +82,11 @@ More information available [here](https://learn.adafruit.com/adafruit-motor-shie
 2. Open the code `gyro.ino`
 3. Compile and upload it to your Arduino board
 
+### Servoing (mBot)
+
+1. Open Arduino IDE
+2. Open the code `servoing.ino`
+3. Compile and upload it to your Arduino board
 
 ### Square path (mBot)
 
