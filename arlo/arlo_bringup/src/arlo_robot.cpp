@@ -1,0 +1,688 @@
+#include <signal.h>
+
+#include <ros/ros.h>
+#include <ros/time.h>
+#include <geometry_msgs/Twist.h>
+#include <std_msgs/String.h>
+#include <sensor_msgs/Range.h>
+#include <sensor_msgs/Imu.h>
+#include <nav_msgs/Odometry.h>
+#include "geometry_msgs/Quaternion.h"
+#include <tf/tf.h>
+#include <tf/transform_broadcaster.h>
+#include "arlo_bringup/RangeArray.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <iostream>
+#include <fcntl.h>
+#include <errno.h>
+#include <termios.h>
+#include <unistd.h>
+
+
+#define fps 10
+#define num_us_sensors 4
+#define num_ir_sensors 4
+
+
+#define WHEEL_NUM                        2
+#define WHEEL_RADIUS                     10
+
+#define LEFT                             0
+#define RIGHT                            1
+
+#define TICK2RAD 0.001533981  // 0.087890625[deg] * 3.14159265359 / 180 = 0.001533981f
+
+
+// Global variables
+ros::Subscriber _cmdvelSubscriber;
+ros::Publisher _encoderPublisher;
+
+ros::Publisher _depthPublisher;
+ros::Publisher _imuPublisher;
+
+// Odometry of Arlo robot
+nav_msgs::Odometry odom;
+ros::Publisher _odomPublisher;
+
+int serial_port;
+
+// Madgwick filter parameters
+double beta = 0.4;
+tf::Quaternion q = tf::Quaternion(0, 0, 0, 1); // Initial quaternion [x, y, z, w]
+
+
+/*******************************************************************************
+* Transform Broadcaster
+*******************************************************************************/
+// TF of Arlo robot
+geometry_msgs::TransformStamped odom_tf;
+//tf::TransformBroadcaster tf_broadcaster;
+
+/*******************************************************************************
+* Calculation for odometry
+*******************************************************************************/
+bool init_encoder = true;
+int32_t last_diff_tick[WHEEL_NUM] = {0, 0};
+double  last_rad[WHEEL_NUM]       = {0.0, 0.0};
+
+/*******************************************************************************
+* Update Joint State
+*******************************************************************************/
+double  last_velocity[WHEEL_NUM]  = {0.0, 0.0};
+
+/*******************************************************************************
+* Declaration for SLAM and navigation
+*******************************************************************************/
+ros::Time prev_update_time;
+float odom_pose[3];
+double odom_vel[3];
+
+char odom_header_frame_id[30] = "base_link";
+char odom_child_frame_id[30] = "odom";
+
+/*******************************************************************************
+* Stock IMU data
+*******************************************************************************/
+
+float acc_float_array[3];
+float rota_float_array[3];
+
+
+
+std::vector<std::size_t> findCommaPositions(const std::string& inputString) {
+    std::vector<std::size_t> commaPositions;
+    std::size_t pos = inputString.find(',');
+
+    while (pos != std::string::npos) {
+        commaPositions.push_back(pos);
+        pos = inputString.find(',', pos + 1);
+    }
+
+    return commaPositions;
+}
+
+void customSigIntHandler(int sig)
+{
+	ROS_INFO("===Stopping Arlo robot===");
+			
+	// stop the robot by sending a zero velocity command
+	// TODO ? on the serial com side?
+	close(serial_port);	
+	// shutdown ROS
+	ros::shutdown();
+}
+
+/*******************************************************************************
+ * Compute orientation thanks to IMU data
+ *******************************************************************************/
+
+tf::Quaternion madgwickFilterUpdate(tf::Quaternion q, tf::Vector3 gyro, tf::Vector3 accel)
+{
+    //double dt = 1.0 / nh.param("~imu_rate", 100.0); // Assuming IMU publishes at 100 Hz
+    double dt = 1.0 / 100.0; // Assuming IMU publishes at 100 Hz
+
+
+    double recipNorm = 1 / sqrt(accel.x() * accel.x() + accel.y() * accel.y() + accel.z() * accel.z());
+    accel *= recipNorm;
+
+    double s0 = 2.0 * (q.w() * gyro.x() + q.z() * gyro.y() - q.y() * gyro.z());
+    double s1 = 2.0 * (q.x() * gyro.x() + q.y() * gyro.y() + q.z() * gyro.z());
+    double s2 = 2.0 * (q.w() * gyro.y() - q.y() * gyro.x() + q.x() * gyro.z());
+    double s3 = 2.0 * (q.w() * gyro.x() + q.x() * gyro.y() - q.y() * gyro.z());
+
+    double qDot1 = 0.5 * (-q.x() * gyro.x() - q.y() * gyro.y() - q.z() * gyro.z() + beta * s1);
+    double qDot2 = 0.5 * (q.w() * gyro.x() + q.z() * gyro.y() - q.y() * gyro.z() + beta * s2);
+    double qDot3 = 0.5 * (q.w() * gyro.y() - q.y() * gyro.x() + q.x() * gyro.z() + beta * s3);
+    double qDot4 = 0.5 * (q.w() * gyro.z() + q.x() * gyro.x() - q.y() * gyro.y() + beta * s0);
+
+    q = tf::Quaternion(q.w() + qDot1 * dt, q.x() + qDot2 * dt, q.y() + qDot3 * dt, q.z() + qDot4 * dt);
+
+    recipNorm = 1 / sqrt(q.w() * q.w() + q.x() * q.x() + q.y() * q.y() + q.z() * q.z());
+    q = tf::Quaternion(q.w() * recipNorm, q.x() * recipNorm, q.y() * recipNorm, q.z() * recipNorm);
+
+    return q;
+}
+
+
+/*******************************************************************************
+* Initialization odometry data
+*******************************************************************************/
+void initOdom(void)
+{
+  init_encoder = true;
+
+  for (int index = 0; index < 3; index++)
+  {
+    odom_pose[index] = 0.0;
+    odom_vel[index]  = 0.0;
+  }
+
+  odom.pose.pose.position.x = 0.0;
+  odom.pose.pose.position.y = 0.0;
+  odom.pose.pose.position.z = 0.0;
+
+  odom.pose.pose.orientation.x = 0.0;
+  odom.pose.pose.orientation.y = 0.0;
+  odom.pose.pose.orientation.z = 0.0;
+  odom.pose.pose.orientation.w = 0.0;
+
+  odom.twist.twist.linear.x  = 0.0;
+  odom.twist.twist.angular.z = 0.0;
+}
+
+/*******************************************************************************
+* Calculate the odometry
+*******************************************************************************/
+bool calcOdometry(double diff_time)
+{
+
+  double wheel_l, wheel_r;      // rotation value of wheel [rad]
+  double delta_s, theta, delta_theta;
+  static double last_theta = 0.0;
+  double v, w;                  // v = translational velocity [m/s], w = rotational velocity [rad/s]
+  double step_time;
+  static float orientation[4];
+
+  wheel_l = wheel_r = 0.0;
+  delta_s = delta_theta = theta = 0.0;
+  v = w = 0.0;
+  step_time = 0.0;
+
+  step_time = diff_time;
+
+  if (step_time == 0)
+    return false;
+
+  wheel_l = TICK2RAD * (double)last_diff_tick[LEFT];
+  wheel_r = TICK2RAD * (double)last_diff_tick[RIGHT];
+
+  if (isnan(wheel_l))
+    wheel_l = 0.0;
+
+  if (isnan(wheel_r))
+    wheel_r = 0.0;
+
+  delta_s     = WHEEL_RADIUS * (wheel_r + wheel_l) / 2.0;
+  // theta = WHEEL_RADIUS * (wheel_r - wheel_l) / WHEEL_SEPARATION;
+
+  //orientation = sensors.getOrientation(); Remplace
+
+  tf::Vector3 linear_acceleration(acc_float_array[0],
+                                  acc_float_array[1],
+                                  acc_float_array[2]);
+
+  tf::Vector3 angular_velocity(rota_float_array[0],
+                               rota_float_array[1],
+                               rota_float_array[2]);
+
+  // Convert angular velocity to radians per second
+  angular_velocity *= M_PI / 180.0;
+
+  // Convert linear acceleration to meters per second squared
+  linear_acceleration *= 9.81;
+
+  q = madgwickFilterUpdate(q, angular_velocity, linear_acceleration);
+
+  orientation[0] = q.x();
+  orientation[1] = q.y();
+  orientation[2] = q.z();
+  orientation[3] = q.w();
+
+  theta       = atan2f(orientation[1]*orientation[2] + orientation[0]*orientation[3],
+                0.5f - orientation[2]*orientation[2] - orientation[3]*orientation[3]);
+
+  delta_theta = theta - last_theta;
+
+  // compute odometric pose
+  odom_pose[0] += delta_s * cos(odom_pose[2] + (delta_theta / 2.0));
+  odom_pose[1] += delta_s * sin(odom_pose[2] + (delta_theta / 2.0));
+  odom_pose[2] += delta_theta;
+
+  // compute odometric instantaneouse velocity
+
+  v = delta_s / step_time;
+  w = delta_theta / step_time;
+
+  odom_vel[0] = v;
+  odom_vel[1] = 0.0;
+  odom_vel[2] = w;
+
+  last_velocity[LEFT]  = wheel_l / step_time;
+  last_velocity[RIGHT] = wheel_r / step_time;
+  last_theta = theta;
+
+  return true;
+}
+
+/*******************************************************************************
+* Update the odometry
+*******************************************************************************/
+void updateOdometry(void)
+{
+  //odom.header.frame_id = odom_header_frame_id;
+  //odom.child_frame_id  = odom_child_frame_id;
+
+  odom.header.frame_id = "base_link";
+  odom.child_frame_id  = "odom";
+
+  odom.pose.pose.position.x = odom_pose[0];
+  odom.pose.pose.position.y = odom_pose[1];
+  odom.pose.pose.position.z = 0;
+
+  //odom.pose.pose.orientation = tf::createQuaternionFromYaw(odom_pose[2]);
+
+  tf::Quaternion tf_quaternion;
+  tf_quaternion.setRPY(0, 0, odom_pose[2]);  // Assuming roll and pitch are 0
+
+  geometry_msgs::Quaternion odom_quaternion;
+  tf::quaternionTFToMsg(tf_quaternion, odom_quaternion);
+
+  odom.pose.pose.orientation = odom_quaternion;
+  //
+
+  odom.twist.twist.linear.x  = odom_vel[0];
+  odom.twist.twist.angular.z = odom_vel[2];
+}
+
+/*******************************************************************************
+* CalcUpdateulate the TF
+*******************************************************************************/
+void updateTF(geometry_msgs::TransformStamped& odom_tf)
+{
+  odom_tf.header = odom.header;
+  odom_tf.child_frame_id = odom.child_frame_id;
+  odom_tf.transform.translation.x = odom.pose.pose.position.x;
+  odom_tf.transform.translation.y = odom.pose.pose.position.y;
+  odom_tf.transform.translation.z = odom.pose.pose.position.z;
+  odom_tf.transform.rotation      = odom.pose.pose.orientation;
+}
+
+
+void cmdCallback(const geometry_msgs::Twist::ConstPtr& velocityCmd)
+{
+	int l_i32LeftWheelSpeed;
+	int l_i32RightWheelSpeed;
+	double l_dLeftWheelSpeedKmh;
+	double l_dRightWheelSpeedKmh;
+
+	float us_1_float, us_2_float, us_3_float, us_4_float;
+	float ir_1_float, ir_2_float, ir_3_float, ir_4_float;
+	float acc_x_float, acc_y_float, acc_z_float;
+	float rota_x_float, rota_y_float, rota_z_float;
+
+	float us_float_array[num_us_sensors] = {us_1_float, us_2_float, us_3_float, us_4_float};
+	float ir_float_array[num_ir_sensors] = {ir_1_float, ir_2_float, ir_3_float, ir_4_float};
+
+
+
+	char* msg;
+	std::string read_buffer;
+	char serial_buf;
+	bool stringComplete = false;
+	bool endCom=false;
+
+        acc_float_array[0] = acc_x_float;
+        acc_float_array[1] = acc_y_float;
+        acc_float_array[2] = acc_z_float;
+
+        rota_float_array[0] = rota_x_float;
+        rota_float_array[1] = rota_y_float;
+        rota_float_array[2] = rota_z_float;
+
+
+        // velocityCmd->linear.x contains velocity translation along x
+	// velocityCmd->angular.z contains velocity translation around z
+	std::cout << "speed= (" << velocityCmd->linear.x << ", " << velocityCmd->angular.z << ")" << std::endl;	
+	// TODO
+	//convert these 2 values and send them to the serial portYour local changes to the following files would be overwritten by merge:
+	asprintf(&msg, "GO_,%.03lf,%.03lf\r",velocityCmd->linear.x,velocityCmd->angular.z);
+	
+	write(serial_port,msg,strlen(msg));
+	
+	// then receive sensor info back from the encoders via serail port
+	// publish them on ros
+	// <type of msg> encoderMsg;
+	// fill with values
+	// publish it
+	//_encoderSubscriber.publish(encoderMsg);
+	while (!stringComplete){
+				
+		int num_bytes = read(serial_port, &serial_buf, sizeof (serial_buf));
+		if (num_bytes != 0)
+		{
+			read_buffer.push_back(serial_buf);
+			//std::cout << "read_buffer = " << read_buffer << std::endl;
+		
+			if (serial_buf == '\r')
+			{
+				stringComplete = true;
+				//std::cout << "stringComplete: " << read_buffer << std::endl;
+			}
+		}
+	}
+
+	
+	//std::cout << "inside stringComplete : " << read_buffer << std::endl;
+	if (read_buffer.find("SPD")!=std::string::npos){
+
+		// Recuperation de positions des virgules
+		std::vector<std::size_t> commaPositions = findCommaPositions(read_buffer); 
+
+		//Recuperation valeurs des encodeurs
+		std::string l_sLeftWheelSpeed = read_buffer.substr(commaPositions[0]+1, commaPositions[1] - commaPositions[0]-1);
+		std::string l_sRightWheelSpeed = read_buffer.substr(commaPositions[1]+1, commaPositions[2] - commaPositions[1]-1);
+		//std::cout << "left = " << l_sLeftWheelSpeed << std::endl;
+		//std::cout << "right = " << l_sRightWheelSpeed << std::endl;
+		l_i32LeftWheelSpeed = stoi(l_sLeftWheelSpeed);
+		l_i32RightWheelSpeed = stoi(l_sRightWheelSpeed);
+		l_dLeftWheelSpeedKmh=l_i32LeftWheelSpeed;
+		l_dRightWheelSpeedKmh=l_i32RightWheelSpeed;
+		std::cout << "(L, R) = (" << l_dLeftWheelSpeedKmh << ", " << l_dRightWheelSpeedKmh << ")" << std::endl;
+
+		//Recuperation des valeurs des capteurs US
+		std::string us_1 = read_buffer.substr(commaPositions[2]+1, commaPositions[3] - commaPositions[2]-1);
+		std::string us_2 = read_buffer.substr(commaPositions[3]+1, commaPositions[4] - commaPositions[3]-1);
+		std::string us_3 = read_buffer.substr(commaPositions[4]+1, commaPositions[5] - commaPositions[4]-1);
+		std::string us_4 = read_buffer.substr(commaPositions[5]+1, commaPositions[6] - commaPositions[5]-1);
+
+		us_1_float = std::stof(us_1);
+		us_2_float = std::stof(us_2);
+		us_3_float = std::stof(us_3);
+		us_4_float = std::stof(us_4);
+
+		//Recuperation des valeurs des capteurs IR
+		std::string ir_1 = read_buffer.substr(commaPositions[6]+1, commaPositions[7] - commaPositions[6]-1);
+		std::string ir_2 = read_buffer.substr(commaPositions[7]+1, commaPositions[8] - commaPositions[7]-1);
+		std::string ir_3 = read_buffer.substr(commaPositions[8]+1, commaPositions[9] - commaPositions[8]-1);
+		std::string ir_4 = read_buffer.substr(commaPositions[9]+1, commaPositions[10] - commaPositions[9]-1);
+
+		ir_1_float = std::stof(ir_1);
+		ir_2_float = std::stof(ir_2);
+		ir_3_float = std::stof(ir_3);
+		ir_4_float = std::stof(ir_4);
+
+		//Recuperation des acceleration de l'imu
+		std::string acc_x = read_buffer.substr(commaPositions[10]+1, commaPositions[11] - commaPositions[10]-1);
+		std::string acc_y = read_buffer.substr(commaPositions[11]+1, commaPositions[12] - commaPositions[11]-1);
+		std::string acc_z = read_buffer.substr(commaPositions[12]+1, commaPositions[13] - commaPositions[12]-1);
+
+		acc_x_float = std::stof(acc_x);
+		acc_y_float = std::stof(acc_y);
+		acc_z_float = std::stof(acc_z);
+
+		//Recuperation des rotation de l'imu
+		std::string rota_x = read_buffer.substr(commaPositions[13]+1, commaPositions[14] - commaPositions[13]-1);
+		std::string rota_y = read_buffer.substr(commaPositions[14]+1, commaPositions[15] - commaPositions[14]-1);
+		std::string rota_z = read_buffer.substr(commaPositions[15]+1, read_buffer.size() - commaPositions[15]-1);
+
+		rota_x_float = std::stof(rota_x);
+		rota_y_float = std::stof(rota_y);
+		rota_z_float = std::stof(rota_z);
+
+
+		/*
+		//std::cout << "SPD found: " <<read_buffer << std::endl;
+		std::size_t posFirstComma = read_buffer.find(",");
+		if (posFirstComma != std::string::npos)
+		{
+			std::size_t posSecondComma = read_buffer.find(",", posFirstComma+1);
+			if (posSecondComma != std::string::npos)
+			{
+				//std::cout << "firstCommaPos = " << posFirstComma << std::endl;
+				//std::cout << "secondCommaPos = " << posSecondComma << std::endl;
+				
+				std::string l_sLeftWheelSpeed = read_buffer.substr(posFirstComma+1, posSecondComma - posFirstComma-1);
+				std::string l_sRightWheelSpeed = read_buffer.substr(posSecondComma+1, read_buffer.size()-posSecondComma-1);
+				//std::cout << "left = " << l_sLeftWheelSpeed << std::endl;
+				//std::cout << "right = " << l_sRightWheelSpeed << std::endl;
+				l_i32LeftWheelSpeed = stoi(l_sLeftWheelSpeed);
+				l_i32RightWheelSpeed = stoi(l_sRightWheelSpeed);
+				l_dLeftWheelSpeedKmh=l_i32LeftWheelSpeed;
+				l_dRightWheelSpeedKmh=l_i32RightWheelSpeed;
+				std::cout << "(L, R) = (" << l_dLeftWheelSpeedKmh << ", " << l_dRightWheelSpeedKmh << ")" << std::endl;
+
+
+			}
+		}
+		*/
+		
+
+		// Publish elements
+
+		//Encoder
+		std::string comma = ",";
+		std_msgs::String encoderMsg;
+		encoderMsg.data= l_sLeftWheelSpeed + comma + l_sRightWheelSpeed;
+		_encoderPublisher.publish(encoderMsg);
+
+		//Depth
+		arlo_bringup::RangeArray sensor_data_array;
+
+		//US
+        for (int i = 0; i < num_us_sensors; ++i) {
+            sensor_msgs::Range sensor_msg;
+            sensor_msg.header.stamp = ros::Time::now();
+            sensor_msg.radiation_type = sensor_msgs::Range::ULTRASOUND;
+            sensor_msg.field_of_view = 1.0472;  // 60 degres en rad
+            sensor_msg.min_range = 0.02;  // 2cm en m
+            sensor_msg.max_range = 1.5;  // 150cm en m
+            sensor_msg.range = us_float_array[i] ;  // Mettre la valeur
+
+            sensor_data_array.range_sensors.push_back(sensor_msg); // Publish msg
+        }
+
+		//IR
+        for (int i = 0; i < num_ir_sensors; ++i) {
+            sensor_msgs::Range sensor_msg;
+            sensor_msg.header.stamp = ros::Time::now();
+            sensor_msg.radiation_type = sensor_msgs::Range::INFRARED;
+            sensor_msg.field_of_view = 0; // pas d'angle, detection seulement sur l'axe du capteur
+            sensor_msg.min_range = 0.15;  // 15cm en m
+            sensor_msg.max_range = 1.5;  // 150cm en m
+            sensor_msg.range = ir_float_array[i];  // Mettre la valeur
+
+            sensor_data_array.range_sensors.push_back(sensor_msg);
+        }
+
+		//_depthPublisher.publish(sensor_data_array); // Publish msg
+		//arlo_bringup::RangeArray sensor_msg;
+		_depthPublisher.publish(sensor_data_array); // Publish msg
+
+		//IMU
+		sensor_msgs::Imu imu_msg;
+		imu_msg.header.stamp = ros::Time::now();
+    	imu_msg.linear_acceleration.x = acc_float_array[0]; // Mettre la valeur
+    	imu_msg.linear_acceleration.y = acc_float_array[1]; // Mettre la valeur
+    	imu_msg.linear_acceleration.z = acc_float_array[2]; // Mettre la valeur
+
+    	imu_msg.angular_velocity.x = rota_float_array[0]; // Mettre la valeur
+    	imu_msg.angular_velocity.y = rota_float_array[1]; // Mettre la valeur
+    	imu_msg.angular_velocity.z = rota_float_array[2]; // Mettre la valeur
+
+    	_imuPublisher.publish(imu_msg); // Publish msg
+
+
+		read_buffer.erase();
+
+                //ODOM
+             /*
+             unsigned long time_now = millis();
+             unsigned long step_time = time_now - prev_update_time;
+
+             prev_update_time = time_now;
+             */
+
+             // Get the current time
+             ros::Time currentTime = ros::Time::now();
+
+             // Calculate the time difference in seconds
+             double step_time_sec = (currentTime - prev_update_time).toSec();
+
+             // Convert the time difference to milliseconds
+             unsigned long step_time = static_cast<unsigned long>(step_time_sec * 1000.0);
+
+             // Update the previous update time
+             prev_update_time = currentTime;
+
+             ros::Time stamp_now = ros::Time::now();
+
+                  // calculate odometry
+                  calcOdometry((double)(step_time * 0.001));
+
+                  // odometry
+                  updateOdometry();
+                  odom.header.stamp = stamp_now;
+                  odom.header.seq++;
+                  _odomPublisher.publish(odom);
+
+                  // odometry tf
+                  updateTF(odom_tf);
+                  odom_tf.header.stamp = stamp_now;
+                  odom_tf.header.seq++;
+                  tf::TransformBroadcaster tf_broadcaster;
+                  tf_broadcaster.sendTransform(odom_tf);
+
+	}		
+	
+
+
+}
+
+
+
+//~ void infraredCallback(const your_package_name::Infrared::ConstPtr& msg)
+//~ {
+    //~ // Process infrared sensor data
+    //~ float distance = msg->distance;
+    //~ // Your code here...
+//~ }
+
+//~ void ultrasoundCallback(const your_package_name::Ultrasound::ConstPtr& msg)
+//~ {
+    //~ // Process ultrasound sensor data
+    //~ float distance = msg->distance;
+    //~ // Your code here...
+//~ }
+
+
+
+
+int main(int argc, char** argv)
+{
+	 // create a node called arlo_control
+        ros::init(argc, argv, "arlo_robot");
+	// create a node handle
+	ros::NodeHandle nh;
+
+
+        //ros::init(argc, argv, "autopilot");
+        //initiate serial port
+	
+	serial_port = open("/dev/ttyS0", O_RDWR);
+	
+
+	if (serial_port < 0)
+	{
+		printf("Error %i from open: %s\n", errno, strerror(errno));
+	}
+	else
+		std::cout << "Serial port opened successfully!" <<std::endl;
+	
+	struct termios tty;
+	
+	if(tcgetattr(serial_port, &tty) !=  0) {
+		printf("Error %i from tcgetattr: %s\n", errno, strerror(errno));
+	}
+	else
+		std::cout << "Structure termios created successfully!" <<std::endl;
+
+	tty.c_cflag &= ~PARENB;
+	tty.c_cflag &= ~CSTOPB;
+	tty.c_cflag |= CS8;
+	tty.c_cflag &= ~CRTSCTS;
+	tty.c_cflag |= CREAD;
+
+	tty.c_lflag &= ~ICANON;
+	tty.c_lflag &= ~ECHO;
+	tty.c_lflag &= ~ECHOE;
+	tty.c_lflag &= ~ECHONL;
+	tty.c_lflag &= ~ISIG;
+
+	tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+	tty.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL);
+
+	tty.c_oflag &= ~OPOST;
+	tty.c_oflag &= ~ONLCR;
+
+	tty.c_cc[VTIME] =10;
+	tty.c_cc[VMIN] =0;
+
+	cfsetispeed(&tty, B115200);
+	cfsetospeed(&tty, B115200);
+
+	if (tcsetattr(serial_port, TCSANOW, &tty) != 0){
+		printf("Error %i from tcsetattr: %s\n", errno, strerror(errno));
+	}
+	else
+		std::cout << "Structure saved successfully!" << std::endl;
+	
+
+       
+
+
+        //tf_broadcaster.init(nh);
+
+        // Setting for SLAM and navigation (odometry, joint states, TF)
+          initOdom();
+
+	// create a subscriber to cmd_vel topic
+	_cmdvelSubscriber = nh.subscribe("cmd_vel", 1, cmdCallback);
+	
+	// create a publisher to broadcast LiDAR data
+	_encoderPublisher = nh.advertise<std_msgs::String>("encoder", 1);
+
+	//_depthPublisher = nh.advertise<std::vector<sensor_msgs::Range>>("depth", 1);
+	_depthPublisher = nh.advertise<arlo_bringup::RangeArray>("depth", 1);
+
+	_imuPublisher = nh.advertise<sensor_msgs::Imu>("imu", 1);
+
+        _odomPublisher = nh.advertise<nav_msgs::Odometry>("odom", 1);
+	
+	//ros::Rate loopRate(10);
+	
+	ROS_INFO("Serial com launched...");
+
+
+	ros::Rate loopRate(fps);
+	
+	ros::spin();
+	
+	/*
+	//ros::spin();
+	while(ros::ok()){
+		
+		//recuperer donn imu
+		//remplir mess
+		sensor_msgs::imu messageImu; //creer un message imu
+
+
+
+
+		//recuperer + remplir msg
+		_imuPublisher.publish(messageImu);
+
+		ros::spinOnce();
+		loopRate.sleep();
+
+	}
+	*/
+
+
+
+
+	return 0;
+}
+
+
